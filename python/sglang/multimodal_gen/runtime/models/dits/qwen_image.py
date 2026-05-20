@@ -10,7 +10,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
@@ -33,8 +32,9 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     apply_qk_norm_with_optional_rope,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
-    ReplicatedLinear,
+    RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -487,6 +487,68 @@ class QwenEmbedLayer3DRope(nn.Module):
         return freqs.clone().contiguous()
 
 
+class QwenImageTPGELU(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        inner_dim: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.proj = ColumnParallelLinear(
+            dim,
+            inner_dim,
+            bias=True,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj",
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states, _ = self.proj(hidden_states)
+        return F.gelu(hidden_states, approximate="tanh")
+
+
+class QwenImageTPFeedForward(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        dim_out: int,
+        mult: int = 4,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        inner_dim = dim * mult
+        self.net = nn.ModuleList(
+            [
+                QwenImageTPGELU(
+                    dim,
+                    inner_dim,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.net.0",
+                ),
+                nn.Dropout(0.0),
+                RowParallelLinear(
+                    inner_dim,
+                    dim_out,
+                    bias=True,
+                    input_is_parallel=True,
+                    reduce_results=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.net.2",
+                ),
+            ]
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.net[0](hidden_states)
+        hidden_states = self.net[1](hidden_states)
+        hidden_states, _ = self.net[2](hidden_states)
+        return hidden_states
+
+
 class QwenImageCrossAttention(nn.Module):
     def __init__(
         self,
@@ -533,9 +595,30 @@ class QwenImageCrossAttention(nn.Module):
             )
         else:
             # Use separate Q/K/V projections for non-quantized models
-            self.to_q = ReplicatedLinear(dim, self.inner_dim, bias=True)
-            self.to_k = ReplicatedLinear(dim, self.inner_dim, bias=True)
-            self.to_v = ReplicatedLinear(dim, self.inner_dim, bias=True)
+            self.to_q = ColumnParallelLinear(
+                dim,
+                self.inner_dim,
+                bias=True,
+                gather_output=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_q",
+            )
+            self.to_k = ColumnParallelLinear(
+                dim,
+                self.inner_dim,
+                bias=True,
+                gather_output=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_k",
+            )
+            self.to_v = ColumnParallelLinear(
+                dim,
+                self.inner_dim,
+                bias=True,
+                gather_output=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_v",
+            )
 
         if self.qk_norm:
             self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
@@ -553,21 +636,38 @@ class QwenImageCrossAttention(nn.Module):
                 )
             else:
                 # Use separate Q/K/V projections for non-quantized models
-                self.add_q_proj = ReplicatedLinear(
-                    added_kv_proj_dim, self.inner_dim, bias=True
+                self.add_q_proj = ColumnParallelLinear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=True,
+                    gather_output=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.add_q_proj",
                 )
-                self.add_k_proj = ReplicatedLinear(
-                    added_kv_proj_dim, self.inner_dim, bias=True
+                self.add_k_proj = ColumnParallelLinear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=True,
+                    gather_output=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.add_k_proj",
                 )
-                self.add_v_proj = ReplicatedLinear(
-                    added_kv_proj_dim, self.inner_dim, bias=True
+                self.add_v_proj = ColumnParallelLinear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=True,
+                    gather_output=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.add_v_proj",
                 )
 
         if context_pre_only is not None and not context_pre_only:
-            self.to_add_out = ReplicatedLinear(
+            self.to_add_out = RowParallelLinear(
                 self.inner_dim,
                 self.dim,
                 bias=out_bias,
+                input_is_parallel=False,
+                reduce_results=True,
                 quant_config=quant_config,
                 prefix=f"{prefix}.to_add_out",
             )
@@ -577,10 +677,12 @@ class QwenImageCrossAttention(nn.Module):
         if not pre_only:
             self.to_out = nn.ModuleList([])
             self.to_out.append(
-                ReplicatedLinear(
+                RowParallelLinear(
                     self.inner_dim,
                     self.dim,
                     bias=out_bias,
+                    input_is_parallel=False,
+                    reduce_results=True,
                     quant_config=quant_config,
                     prefix=f"{prefix}.to_out.0",
                 )
@@ -725,10 +827,11 @@ class QwenImageTransformerBlock(nn.Module):
         # Image processing modules
         self.img_mod = nn.Sequential(
             nn.SiLU(),
-            ReplicatedLinear(
+            ColumnParallelLinear(
                 dim,
                 6 * dim,
                 bias=True,
+                gather_output=True,
                 quant_config=quant_config,
                 prefix=f"{prefix}.img_mod",
             ),  # For scale, shift, gate for norm1 and norm2
@@ -753,10 +856,11 @@ class QwenImageTransformerBlock(nn.Module):
         # Text processing modules
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
-            ReplicatedLinear(
+            ColumnParallelLinear(
                 dim,
                 6 * dim,
                 bias=True,
+                gather_output=True,
                 quant_config=quant_config,
                 prefix=f"{prefix}.txt_mod",
             ),  # For scale, shift, gate for norm1 and norm2
@@ -790,15 +894,17 @@ class QwenImageTransformerBlock(nn.Module):
                 activation_fn="gelu-approximate",
             )
         else:
-            self.img_mlp = FeedForward(
+            self.img_mlp = QwenImageTPFeedForward(
                 dim=dim,
                 dim_out=dim,
-                activation_fn="gelu-approximate",
+                quant_config=quant_config,
+                prefix=f"{prefix}.img_mlp",
             )
-            self.txt_mlp = FeedForward(
+            self.txt_mlp = QwenImageTPFeedForward(
                 dim=dim,
                 dim_out=dim,
-                activation_fn="gelu-approximate",
+                quant_config=quant_config,
+                prefix=f"{prefix}.txt_mlp",
             )
 
         if nunchaku_enabled:

@@ -15,6 +15,7 @@ from functools import lru_cache
 from typing import Any
 
 import torch
+import torch_npu
 import torch.nn as nn
 from einops import rearrange
 from tqdm.auto import tqdm
@@ -1007,7 +1008,31 @@ class DenoisingStage(PipelineStage):
 
         # Run denoising loop
         denoising_start_time = time.time()
-
+        
+        # experimental_config = torch_npu.profiler._ExperimentalConfig(
+        #     export_type=[
+        #         torch_npu.profiler.ExportType.Text
+        #         ],
+        #     profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+        #     msprof_tx=False,
+        #     aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+        #     l2_cache=False,
+        #     op_attr=False,
+        #     data_simplification=False,
+        #     record_op_args=False,
+        #     gc_detect_threshold=None
+        # )
+        # prof = torch_npu.profiler.profile(
+        #     activities=[
+        #         torch_npu.profiler.ProfilerActivity.CPU,
+        #         torch_npu.profiler.ProfilerActivity.NPU
+        #         ],
+        #     schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=40, repeat=1, skip_first=0),
+        #     on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("./result"),
+        #     profile_memory=False, # Close the collection of memory information
+        #     with_stack=False,    # Close the collection of stack information
+        #     experimental_config=experimental_config)
+        # prof.start()
         # to avoid device-sync caused by timestep comparison
         is_warmup = batch.is_warmup
         self.scheduler.set_begin_index(0)
@@ -1020,105 +1045,103 @@ class DenoisingStage(PipelineStage):
         ):
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for i, t_host in enumerate(timesteps_cpu):
-                    with StageProfiler(
-                        f"denoising_step_{i}",
-                        logger=logger,
-                        metrics=batch.metrics,
-                        perf_dump_path_provided=batch.perf_dump_path is not None,
-                    ):
-                        t_int = int(t_host.item())
-                        t_device = timesteps[i]
-                        current_model, current_guidance_scale = (
-                            self._select_and_manage_model(
-                                t_int=t_int,
-                                boundary_timestep=boundary_timestep,
-                                server_args=server_args,
-                                batch=batch,
-                            )
-                        )
-
-                        # Expand latents for I2V
-                        latent_model_input = latents.to(target_dtype)
-                        if batch.image_latent is not None:
-                            assert (
-                                not server_args.pipeline_config.task_type
-                                == ModelTaskType.TI2V
-                            ), "image latents should not be provided for TI2V task"
-                            latent_model_input = torch.cat(
-                                [latent_model_input, batch.image_latent], dim=1
-                            ).to(target_dtype)
-
-                        timestep = self.expand_timestep_before_forward(
-                            batch,
-                            server_args,
-                            t_device,
-                            target_dtype,
-                            seq_len,
-                            reserved_frames_mask,
-                        )
-
-                        latent_model_input = self.scheduler.scale_model_input(
-                            latent_model_input, t_device
-                        )
-
-                        # Predict noise residual
-                        attn_metadata = self._build_attn_metadata(
-                            i,
-                            batch,
-                            server_args,
-                            timestep_value=t_int,
-                            timesteps=timesteps_cpu,
-                        )
-                        noise_pred = self._predict_noise_with_cfg(
-                            current_model=current_model,
-                            latent_model_input=latent_model_input,
-                            timestep=timestep,
-                            batch=batch,
-                            timestep_index=i,
-                            attn_metadata=attn_metadata,
-                            target_dtype=target_dtype,
-                            current_guidance_scale=current_guidance_scale,
-                            image_kwargs=image_kwargs,
-                            pos_cond_kwargs=pos_cond_kwargs,
-                            neg_cond_kwargs=neg_cond_kwargs,
+                    
+                    t_int = int(t_host.item())
+                    t_device = timesteps[i]
+                    current_model, current_guidance_scale = (
+                        self._select_and_manage_model(
+                            t_int=t_int,
+                            boundary_timestep=boundary_timestep,
                             server_args=server_args,
-                            guidance=guidance,
-                            latents=latents,
+                            batch=batch,
                         )
+                    )
 
-                        # Save noise_pred to batch for external access (e.g., ComfyUI)
-                        if server_args.comfyui_mode:
-                            batch.noise_pred = noise_pred
+                    # Expand latents for I2V
+                    latent_model_input = latents.to(target_dtype)
+                    if batch.image_latent is not None:
+                        assert (
+                            not server_args.pipeline_config.task_type
+                            == ModelTaskType.TI2V
+                        ), "image latents should not be provided for TI2V task"
+                        latent_model_input = torch.cat(
+                            [latent_model_input, batch.image_latent], dim=1
+                        ).to(target_dtype)
 
-                        # Compute the previous noisy sample
-                        latents = self.scheduler.step(
-                            model_output=noise_pred,
-                            timestep=t_device,
-                            sample=latents,
-                            **extra_step_kwargs,
-                            return_dict=False,
-                        )[0]
+                    timestep = self.expand_timestep_before_forward(
+                        batch,
+                        server_args,
+                        t_device,
+                        target_dtype,
+                        seq_len,
+                        reserved_frames_mask,
+                    )
 
-                        latents = self.post_forward_for_ti2v_task(
-                            batch, server_args, reserved_frames_mask, latents, z
-                        )
+                    latent_model_input = self.scheduler.scale_model_input(
+                        latent_model_input, t_device
+                    )
 
-                        # save trajectory latents if needed
-                        if batch.return_trajectory_latents:
-                            trajectory_timesteps.append(t_host)
-                            trajectory_latents.append(latents)
+                    # Predict noise residual
+                    attn_metadata = self._build_attn_metadata(
+                        i,
+                        batch,
+                        server_args,
+                        timestep_value=t_int,
+                        timesteps=timesteps_cpu,
+                    )
+                    noise_pred = self._predict_noise_with_cfg(
+                        current_model=current_model,
+                        latent_model_input=latent_model_input,
+                        timestep=timestep,
+                        batch=batch,
+                        timestep_index=i,
+                        attn_metadata=attn_metadata,
+                        target_dtype=target_dtype,
+                        current_guidance_scale=current_guidance_scale,
+                        image_kwargs=image_kwargs,
+                        pos_cond_kwargs=pos_cond_kwargs,
+                        neg_cond_kwargs=neg_cond_kwargs,
+                        server_args=server_args,
+                        guidance=guidance,
+                        latents=latents,
+                    )
 
-                        # Update progress bar
-                        if i == num_timesteps - 1 or (
-                            (i + 1) > num_warmup_steps
-                            and (i + 1) % self.scheduler.order == 0
-                            and progress_bar is not None
-                        ):
-                            progress_bar.update()
+                    # Save noise_pred to batch for external access (e.g., ComfyUI)
+                    if server_args.comfyui_mode:
+                        batch.noise_pred = noise_pred
 
-                        if not is_warmup:
-                            self.step_profile()
+                    # Compute the previous noisy sample
+                    latents = self.scheduler.step(
+                        model_output=noise_pred,
+                        timestep=t_device,
+                        sample=latents,
+                        **extra_step_kwargs,
+                        return_dict=False,
+                    )[0]
 
+                    latents = self.post_forward_for_ti2v_task(
+                        batch, server_args, reserved_frames_mask, latents, z
+                    )
+
+                    # save trajectory latents if needed
+                    if batch.return_trajectory_latents:
+                        trajectory_timesteps.append(t_host)
+                        trajectory_latents.append(latents)
+
+                    # Update progress bar
+                    if i == num_timesteps - 1 or (
+                        (i + 1) > num_warmup_steps
+                        and (i + 1) % self.scheduler.order == 0
+                        and progress_bar is not None
+                    ):
+                        progress_bar.update()
+
+                    # if not is_warmup:
+                    #     self.step_profile()
+                        # prof.step()
+                    # exit(0)
+        # prof.step()
+        # prof.stop()
         denoising_end_time = time.time()
 
         if num_timesteps > 0 and not is_warmup:

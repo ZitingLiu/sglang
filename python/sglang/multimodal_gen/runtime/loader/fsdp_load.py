@@ -12,6 +12,7 @@ from itertools import chain
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed import DeviceMesh, init_device_mesh
 from torch.distributed._tensor import distribute_tensor
@@ -48,6 +49,56 @@ _QUANTIZED_DTYPES = (
     torch.int8,
 )
 _DTYPE_MISMATCH_EXAMPLE_LIMIT = 3
+
+
+def _get_dist_rank_for_logging() -> str:
+    if dist.is_available() and dist.is_initialized():
+        return f"rank={dist.get_rank()}"
+    return "rank=unknown"
+
+
+def _tensor_nbytes(tensor: torch.Tensor) -> int:
+    return tensor.numel() * tensor.element_size()
+
+
+def _log_model_memory_summary(model: torch.nn.Module, *, is_fsdp_model: bool) -> None:
+    param_bytes = 0
+    buffer_bytes = 0
+    tp_loader_param_bytes = 0
+    tp_dim_attr_param_bytes = 0
+    device_bytes: Counter[str] = Counter()
+    dtype_bytes: Counter[str] = Counter()
+
+    for _, param in model.named_parameters():
+        nbytes = _tensor_nbytes(param)
+        param_bytes += nbytes
+        device_bytes[str(param.device)] += nbytes
+        dtype_bytes[str(param.dtype)] += nbytes
+        if getattr(param, "weight_loader", None) is not None:
+            tp_loader_param_bytes += nbytes
+        if getattr(param, "input_dim", None) is not None or getattr(param, "output_dim", None) is not None:
+            tp_dim_attr_param_bytes += nbytes
+
+    for _, buffer in model.named_buffers():
+        nbytes = _tensor_nbytes(buffer)
+        buffer_bytes += nbytes
+        device_bytes[str(buffer.device)] += nbytes
+        dtype_bytes[str(buffer.dtype)] += nbytes
+
+    gib = 1024**3
+    logger.info(
+        "Model memory summary (%s, fsdp=%s): params=%.2f GiB, buffers=%.2f GiB, "
+        "params_with_weight_loader=%.2f GiB, params_with_tp_dim_attrs=%.2f GiB, devices=%s, dtypes=%s",
+        _get_dist_rank_for_logging(),
+        is_fsdp_model,
+        param_bytes / gib,
+        buffer_bytes / gib,
+        tp_loader_param_bytes / gib,
+        tp_dim_attr_param_bytes / gib,
+        dict(device_bytes),
+        dict(dtype_bytes),
+        main_process_only=False,
+    )
 
 
 def _format_dtype_mismatch_summary(
@@ -356,14 +407,14 @@ def load_model_from_full_model_state_dict(
                     )
 
         if not hasattr(meta_sharded_param, "device_mesh"):
-            full_tensor = full_tensor.to(device=device, dtype=target_dtype)
             actual_param = param_dict.get(target_param_name)
             weight_loader = (
                 getattr(actual_param, "weight_loader", None)
                 if actual_param is not None
                 else None
             )
-            if weight_loader is not None:
+            if weight_loader is not None and not is_fsdp_model:
+                full_tensor = full_tensor.to(dtype=target_dtype)
                 assert actual_param is not None
                 sharded_tensor = torch.empty_like(
                     meta_sharded_param, device=device, dtype=target_dtype
@@ -379,8 +430,25 @@ def load_model_from_full_model_state_dict(
                 weight_loader(temp_param, full_tensor)
                 sharded_tensor = temp_param.data
             else:
-                # In cases where parts of the model aren't sharded, some parameters will be plain tensors
-                sharded_tensor = full_tensor
+                full_tensor = full_tensor.to(device=device, dtype=target_dtype)
+                if weight_loader is not None:
+                    assert actual_param is not None
+                    sharded_tensor = torch.empty_like(
+                        meta_sharded_param, device=device, dtype=target_dtype
+                    )
+                    # Preserve requires_grad flag to avoid errors with non-floating dtypes
+                    requires_grad = getattr(meta_sharded_param, "requires_grad", False)
+                    temp_param = _make_param_like(actual_param, sharded_tensor)
+                    if not (
+                        sharded_tensor.is_floating_point() or sharded_tensor.is_complex()
+                    ):
+                        requires_grad = False
+                    temp_param.requires_grad = requires_grad
+                    weight_loader(temp_param, full_tensor)
+                    sharded_tensor = temp_param.data
+                else:
+                    # In cases where parts of the model aren't sharded, some parameters will be plain tensors
+                    sharded_tensor = full_tensor
 
             # Important: `cpu_offload` is intended for FSDP-managed parameter movement.
             # If a parameter is not sharded into a DTensor (i.e., no `device_mesh`), FSDP
@@ -518,5 +586,6 @@ def load_model_from_full_model_state_dict(
                 sharded_tensor = sharded_tensor.cpu()
         sharded_sd[new_param_name] = nn.Parameter(sharded_tensor)
 
-    # choose `assign=True` since we cannot call `copy_` on meta tensor
-    return model.load_state_dict(sharded_sd, strict=strict, assign=True)
+    incompatible_keys = model.load_state_dict(sharded_sd, strict=strict, assign=True)
+    _log_model_memory_summary(model, is_fsdp_model=is_fsdp_model)
+    return incompatible_keys
