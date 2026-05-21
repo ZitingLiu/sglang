@@ -85,21 +85,6 @@ def _log_model_memory_summary(model: torch.nn.Module, *, is_fsdp_model: bool) ->
         device_bytes[str(buffer.device)] += nbytes
         dtype_bytes[str(buffer.dtype)] += nbytes
 
-    gib = 1024**3
-    logger.info(
-        "Model memory summary (%s, fsdp=%s): params=%.2f GiB, buffers=%.2f GiB, "
-        "params_with_weight_loader=%.2f GiB, params_with_tp_dim_attrs=%.2f GiB, devices=%s, dtypes=%s",
-        _get_dist_rank_for_logging(),
-        is_fsdp_model,
-        param_bytes / gib,
-        buffer_bytes / gib,
-        tp_loader_param_bytes / gib,
-        tp_dim_attr_param_bytes / gib,
-        dict(device_bytes),
-        dict(dtype_bytes),
-        main_process_only=False,
-    )
-
 
 def _format_dtype_mismatch_summary(
     mismatch_counts: Counter[tuple[torch.dtype, torch.dtype]],
