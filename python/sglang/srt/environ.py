@@ -264,6 +264,7 @@ class Envs:
     IS_H200 = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_ENABLE_CP_V2 = EnvBool(False)
+    SGLANG_ALLOW_CROSS_MACHINE_CP = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_PROFILE_V2 = EnvBool(False)
