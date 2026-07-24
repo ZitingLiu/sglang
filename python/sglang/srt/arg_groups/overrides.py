@@ -359,9 +359,56 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                         "moe_a2a_backend=deepep, ep_size=tp_size, batch_size=1."
                     )
                 else:
-                    assert (
-                        server_args.dp_size == 1
-                    ), "interleave DSA CP does not support DP attention."
+                    # Experimental support for interleave DSA CP with DP attention.
+                    if server_args.dp_size < 1:
+                        raise ValueError(
+                            "Invalid interleave DSA CP topology: "
+                            f"dp_size must be >= 1, but got "
+                            f"dp_size={server_args.dp_size}."
+                        )
+
+                    if server_args.tp_size % server_args.dp_size != 0:
+                        raise ValueError(
+                            "Invalid interleave DSA CP topology: "
+                            f"tp_size={server_args.tp_size} must be divisible "
+                            f"by dp_size={server_args.dp_size}."
+                        )
+
+                    resolved_attn_cp_size = (
+                        server_args.tp_size // server_args.dp_size
+                    )
+
+                    if server_args.attn_cp_size not in (
+                        1,
+                        resolved_attn_cp_size,
+                    ):
+                        raise ValueError(
+                            "The current interleave DSA CP communicator keeps "
+                            "attn_tp_size=1, so attn_cp_size must equal "
+                            "tp_size // dp_size. "
+                            f"Expected attn_cp_size={resolved_attn_cp_size}, "
+                            f"but got attn_cp_size={server_args.attn_cp_size}. "
+                            f"Topology: tp_size={server_args.tp_size}, "
+                            f"dp_size={server_args.dp_size}."
+                        )
+
+                    if (
+                        server_args.dp_size > 1
+                        and not server_args.enable_dp_attention_local_control_broadcast
+                    ):
+                        raise ValueError(
+                            "Interleave DSA CP with dp_size > 1 requires "
+                            "--enable-dp-attention-local-control-broadcast."
+                        )
+
+                    logger.warning(
+                        "Experimental interleave DSA CP with DP attention "
+                        "has been enabled: "
+                        f"tp_size={server_args.tp_size}, "
+                        f"dp_size={server_args.dp_size}, "
+                        f"attn_cp_size={resolved_attn_cp_size}, "
+                        "attn_tp_size=1."
+                    )
                 assert (
                     server_args.tp_size <= 8
                 ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
