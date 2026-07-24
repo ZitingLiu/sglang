@@ -60,6 +60,9 @@ from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
+_LOG_TRANSFERS = os.getenv("SGLANG_MOONCAKE_LOG_TRANSFERS", "0") == "1"
+_STAGGER_DST_ORDER = os.getenv("SGLANG_MOONCAKE_STAGGER_DST_ORDER", "0") == "1"
+
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
@@ -1306,11 +1309,26 @@ class MooncakeKVManager(CommonKVManager):
                     and staging_buffer is not None
                 ):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
-                reqs_to_be_processed = (
+                reqs_to_be_processed = list(
                     self.transfer_infos[kv_chunk.room].values()
                     if kv_chunk.room in self.transfer_infos
                     else []
                 )
+                if _STAGGER_DST_ORDER:
+                    # Rotate destinations by source CP rank so concurrently running
+                    # CP workers do not all start by writing to the same decode rank.
+                    def destination_order(req: TransferInfo):
+                        info = self.decode_kv_args_table.get(req.mooncake_session_id)
+                        if info is None:
+                            return (1, 0, req.mooncake_session_id)
+                        dst_size = max(1, info.dst_attn_tp_size)
+                        return (
+                            0,
+                            (info.dst_tp_rank - self.attn_cp_rank) % dst_size,
+                            info.dst_tp_rank,
+                        )
+
+                    reqs_to_be_processed.sort(key=destination_order)
                 polls = []
                 dst_ranks_infos = []
                 # Unique id per prefill sender so decode's response set size matches expected_response_num.
@@ -1322,7 +1340,7 @@ class MooncakeKVManager(CommonKVManager):
                 # When staging transfer is not yet ready (watermark/allocation pending),
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
-                for req in reqs_to_be_processed:
+                for req_idx, req in enumerate(reqs_to_be_processed):
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
                         # Early exit if the request has failed
@@ -1359,6 +1377,7 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+                        kv_send_start_ts = time.perf_counter()
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
@@ -1406,6 +1425,27 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_attn_tp_size,
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
+                            )
+                        kv_send_duration_ms = (
+                            time.perf_counter() - kv_send_start_ts
+                        ) * 1000
+                        if _LOG_TRANSFERS:
+                            kv_bytes = len(kv_chunk.prefill_kv_indices) * sum(
+                                self.kv_args.kv_item_lens
+                            )
+                            logger.info(
+                                "[MOONCAKE_TRANSFER_DIAG] room=%s src_cp=%d "
+                                "src_tp=%d dst_tp=%d ordinal=%d/%d bytes=%d "
+                                "duration_ms=%.3f stagger=%s",
+                                kv_chunk.room,
+                                self.attn_cp_rank,
+                                self.attn_tp_rank,
+                                target_rank_registration_info.dst_tp_rank,
+                                req_idx + 1,
+                                len(reqs_to_be_processed),
+                                kv_bytes,
+                                kv_send_duration_ms,
+                                _STAGGER_DST_ORDER,
                             )
                         if ret != 0:
                             with self.session_lock:
